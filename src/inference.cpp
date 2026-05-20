@@ -13,18 +13,31 @@ bool InferenceEngine::init(LlamaModel *m, Tokenizer *tok, OpenClBackend *backend
     state.max_seq_len = max_seq_len;
 
     int64_t n_embd = model->n_embd;
-    int64_t max_layer_w = std::max(n_embd * n_embd * 4,    // QKV+O proj: 4 * n_embd^2
-                                    n_embd * model->n_ff * 4 * 3); // MLP: gate+up+down
+    int64_t n_head = model->n_head;
+    int64_t n_kv_head = model->n_head_kv;
+    int64_t head_dim = model->n_embd_head_k;
+    int64_t n_ff = model->n_ff;
+    int64_t q_size = n_head * head_dim;
+    int64_t kv_size = n_kv_head * head_dim;
 
-    // Find the largest tensor in the model (output.weight / token_embd.weight
-    // can be much larger than a single layer's weights)
-    int64_t max_tensor_ne = max_layer_w;
+    // Dedicated scratch arena: no buffer reuse
+    // hidden[n_embd] + residual[n_embd] + q_buf[q_size] + k_buf[kv_size]
+    // + v_buf[kv_size] + gate_buf[n_ff] + up_buf[n_ff]
+    // + scores[n_head * max_seq_len] + attn_out[n_embd]
+    int64_t scratch_size = n_embd * 3 + q_size + kv_size * 2
+                         + n_ff * 2 + n_head * max_seq_len + n_embd;
+    act.resize((size_t)scratch_size);
+
+    // Weight buffer: largest tensor in the model (output.weight can be huge)
+    int64_t max_tensor_ne = 0;
     for (auto &[name, t] : m->tensors) {
         max_tensor_ne = std::max(max_tensor_ne, t.nelements());
     }
-
-    act.resize((size_t)(max_seq_len * n_embd * 4));
     weights.resize((size_t)max_tensor_ne);
+
+    // Largest layer weight (for GPU upload, typically Q/K/V/O/gate/up/down = ~7 * n_embd^2 for SmolLM2)
+    int64_t max_layer_weight = std::max(n_embd * n_embd * 4,
+                                        n_embd * n_ff * 4 * 3);
 
     // KV cache: [n_layer, 2, max_seq_len, n_embd]
     state.kv_cache.resize((size_t)(model->n_layer * 2 * max_seq_len * n_embd), 0.0f);
@@ -32,8 +45,8 @@ bool InferenceEngine::init(LlamaModel *m, Tokenizer *tok, OpenClBackend *backend
     if (cl && cl->initialized) {
         state.use_gpu = true;
         state.n_embd_state = n_embd;
-        state.gpu_act.alloc(cl->dev.context, (size_t)(max_seq_len * n_embd * 4));
-        state.gpu_weights.alloc(cl->dev.context, (size_t)max_layer_w);
+        state.gpu_act.alloc(cl->dev.context, (size_t)scratch_size);
+        state.gpu_weights.alloc(cl->dev.context, (size_t)max_layer_weight);
         state.gpu_k.alloc(cl->dev.context, (size_t)(max_seq_len * n_embd * 4));
         state.gpu_v.alloc(cl->dev.context, (size_t)(max_seq_len * n_embd * 4));
         state.gpu_score.alloc(cl->dev.context, (size_t)(max_seq_len * 4));
@@ -139,7 +152,9 @@ void InferenceEngine::add_cpu(float *dst, const float *a, const float *b, int64_
 void InferenceEngine::forward_layer(int layer, int token_id, float *hidden,
                                      float *k_slice, float *v_slice,
                                      float *scores, float *attn_out,
-                                     float *residual) {
+                                     float *residual,
+                                     float *q_buf, float *k_buf, float *v_buf,
+                                     float *gate_buf, float *up_buf) {
     int64_t n_embd = model->n_embd;
     int64_t n_head = model->n_head;
     int64_t n_kv_head = model->n_head_kv;
@@ -176,8 +191,6 @@ void InferenceEngine::forward_layer(int layer, int token_id, float *hidden,
     dequant_run(tensor_name("attn_norm").c_str(), weights.data());
     rms_norm_cpu(hidden, hidden, weights.data(), n_embd, 1);
 
-
-
     //--------------------------------------------------------------------------
     // QKV Projection
     //--------------------------------------------------------------------------
@@ -189,9 +202,9 @@ void InferenceEngine::forward_layer(int layer, int token_id, float *hidden,
     int64_t q_size = n_head * head_dim;
     int64_t kv_size = n_kv_head * head_dim;
 
-    float *q = hidden + n_embd;
-    float *k = q + q_size;
-    float *v = k + kv_size;
+    float *q = q_buf;
+    float *k = k_buf;
+    float *v = v_buf;
 
     if (w_Q) {
         dequant_run(w_Q->name.c_str(), weights.data());
@@ -264,11 +277,11 @@ void InferenceEngine::forward_layer(int layer, int token_id, float *hidden,
         }
     }
 
-    // Output projection (q buffer is freed after attention, reuse as temp output)
+    // Output projection (use gate_buf as temp — copy to attn_out, gate overwrites later)
     if (w_O) {
         dequant_run(w_O->name.c_str(), weights.data());
-        matmul_nt_cpu(q, attn_out, weights.data(), 1, n_embd, n_embd);
-        memcpy(attn_out, q, n_embd * sizeof(float));
+        matmul_nt_cpu(gate_buf, attn_out, weights.data(), 1, n_embd, n_embd);
+        memcpy(attn_out, gate_buf, n_embd * sizeof(float));
     }
 
     // Residual: hidden = residual (original) + attention output
@@ -287,23 +300,19 @@ void InferenceEngine::forward_layer(int layer, int token_id, float *hidden,
     auto w_ffn_up = get_weight("ffn_up");
     auto w_ffn_down = get_weight("ffn_down");
 
-    // ffn_up scratch placed past residual to avoid overlap with q (gate)
-    float *ffn_up = residual + n_embd;
-
     if (w_ffn_gate && w_ffn_up) {
         dequant_run(w_ffn_gate->name.c_str(), weights.data());
-        matmul_nt_cpu(q, hidden, weights.data(), 1, n_ff, n_embd); // q = gate proj
+        matmul_nt_cpu(gate_buf, hidden, weights.data(), 1, n_ff, n_embd);
 
         dequant_run(w_ffn_up->name.c_str(), weights.data());
-        matmul_nt_cpu(ffn_up, hidden, weights.data(), 1, n_ff, n_embd); // ffn_up = up proj
+        matmul_nt_cpu(up_buf, hidden, weights.data(), 1, n_ff, n_embd);
 
-        // SiLU(gate) * up
-        silu_cpu(q, q, n_ff);
-        for (int64_t i = 0; i < n_ff; i++) q[i] *= ffn_up[i];
+        silu_cpu(gate_buf, gate_buf, n_ff);
+        for (int64_t i = 0; i < n_ff; i++) gate_buf[i] *= up_buf[i];
 
         if (w_ffn_down) {
             dequant_run(w_ffn_down->name.c_str(), weights.data());
-            matmul_nt_cpu(hidden, q, weights.data(), 1, n_embd, n_ff);
+            matmul_nt_cpu(hidden, gate_buf, weights.data(), 1, n_embd, n_ff);
         }
 
         add_cpu(hidden, residual, hidden, n_embd);
@@ -366,21 +375,29 @@ int InferenceEngine::forward(int token_id, float *logits) {
     }
 
     int64_t n_head_ = model->n_head;
-    int64_t q_size_ = n_head_ * model->n_embd_head_k;
+    int64_t n_kv_head_ = model->n_head_kv;
+    int64_t head_dim_ = model->n_embd_head_k;
+    int64_t q_size_ = n_head_ * head_dim_;
+    int64_t kv_size_ = n_kv_head_ * head_dim_;
     int64_t n_ff = model->n_ff;
-    // scratch area after hidden + q/k/v must be past FFN's k extent (n_embd + q_size + n_ff)
-    int64_t scratch_offset = n_embd + q_size_ + n_ff;
-    // Process each layer
+
+    // Dedicated scratch buffers (no overlap, no reuse)
+    float *residual = hidden + n_embd;
+    float *q_buf = residual + n_embd;
+    float *k_buf = q_buf + q_size_;
+    float *v_buf = k_buf + kv_size_;
+    float *gate_buf = v_buf + kv_size_;
+    float *up_buf = gate_buf + n_ff;
+    float *scores = up_buf + n_ff;
+    float *attn_out = scores + n_head_ * state.max_seq_len;
+
     for (int64_t layer = 0; layer < n_layers; layer++) {
         float *k_slice = state.kv_cache.data() + layer * 2 * state.max_seq_len * n_embd;
         float *v_slice = k_slice + state.max_seq_len * n_embd;
 
-        float *scores = act.data() + scratch_offset;
-        float *attn_out = scores + n_head_ * S;
-        float *residual = attn_out + n_embd;
-
         forward_layer((int)layer, token_id, hidden, k_slice, v_slice,
-                      scores, attn_out, residual);
+                      scores, attn_out, residual,
+                      q_buf, k_buf, v_buf, gate_buf, up_buf);
     }
 
     // Final RMS Norm

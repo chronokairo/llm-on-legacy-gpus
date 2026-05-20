@@ -57,5 +57,7 @@ private:
     // Core attention + FFN for one layer (uses CPU or GPU)
     void forward_layer(int layer, int token_id, float *hidden,
                        float *k_slice, float *v_slice, float *scores,
-                       float *attn_out, float *residual);
+                       float *attn_out, float *residual,
+                       float *q_buf, float *k_buf, float *v_buf,
+                       float *gate_buf, float *up_buf);
 };
