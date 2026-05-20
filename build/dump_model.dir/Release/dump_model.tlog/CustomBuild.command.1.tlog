@@ -1,0 +1,10 @@
+^C:\USERS\LUANN\DOCUMENTS\GITHUB\CAICOS_INFERENCE\CAICOS_RT\CMAKELISTS.TXT
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SC:/Users/luann/Documents/GitHub/caicos_inference/caicos_rt -BC:/Users/luann/Documents/GitHub/caicos_inference/caicos_rt/build --check-stamp-file C:/Users/luann/Documents/GitHub/caicos_inference/caicos_rt/build/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
