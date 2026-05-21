@@ -1,4 +1,4 @@
-// caicos_rt - f32 OpenCL 1.2 kernels
+// llm-on-legacy-gpus - f32 OpenCL 1.2 kernels
 // No FP16, no subgroups, pure OpenCL C 1.2
 
 //------------------------------------------------------------------------------
